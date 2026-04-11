@@ -26,7 +26,7 @@ MAX_FILE_SIZE_MB = 10
 MAX_DIMENSION    = 768
 ALLOWED_TYPES    = {"jpg", "jpeg", "png"}
 
-HF_API_URL = "https://router.huggingface.co/hf-inference/models/runwayml/stable-diffusion-inpainting"
+"https://router.huggingface.co/hf-inference/models/diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
 
 try:
     HF_TOKEN = st.secrets["HF_TOKEN"]
@@ -183,12 +183,15 @@ def texture_to_prompt(texture_pil):
     )
 
 def call_hf_inpainting(img_pil, mask_pil, prompt, negative_prompt, max_retries=3):
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
     payload = {
         "inputs": prompt,
         "parameters": {
             "negative_prompt": negative_prompt,
-            "num_inference_steps": 30,
+            "num_inference_steps": 25,
             "guidance_scale": 7.5,
             "strength": 0.95,
         },
@@ -213,6 +216,14 @@ def call_hf_inpainting(img_pil, mask_pil, prompt, negative_prompt, max_retries=3
             wait = 30 * (attempt + 1)
             st.warning(f"⏳ Model loading... tunggu {wait} detik (attempt {attempt+1}/{max_retries})")
             time.sleep(wait)
+
+        elif response.status_code == 422:
+            # Coba resize ke 1024x1024 yang dibutuhkan SDXL
+            img_resized  = img_pil.resize((1024, 1024), Image.LANCZOS)
+            mask_resized = mask_pil.resize((1024, 1024), Image.NEAREST)
+            payload["image"]      = pil_to_b64(img_resized)
+            payload["mask_image"] = pil_to_b64(mask_resized)
+            continue
 
         else:
             return None, f"API error {response.status_code}: {response.text[:200]}"
