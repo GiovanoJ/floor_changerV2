@@ -1,0 +1,6 @@
+streamlit
+onnxruntime
+numpy
+opencv-python-headless
+Pillow
+requests
