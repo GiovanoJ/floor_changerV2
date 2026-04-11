@@ -26,7 +26,7 @@ MAX_FILE_SIZE_MB = 10
 MAX_DIMENSION    = 768
 ALLOWED_TYPES    = {"jpg", "jpeg", "png"}
 
-"https://router.huggingface.co/hf-inference/models/diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+HF_API_URL = "https://router.huggingface.co/hf-inference/models/diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
 
 try:
     HF_TOKEN = st.secrets["HF_TOKEN"]
