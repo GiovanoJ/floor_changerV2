@@ -26,19 +26,21 @@ MAX_FILE_SIZE_MB = 10
 MAX_DIMENSION    = 768
 ALLOWED_TYPES    = {"jpg", "jpeg", "png"}
 
-HF_API_URL = "https://router.huggingface.co/hf-inference/models/diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+ML_INPAINT_URL = "https://modelslab.com/api/v6/image_editing/inpaint"
+ML_FETCH_URL   = "https://modelslab.com/api/v6/image_editing/fetch"
 
+# ── API KEY ──────────────────────────────────────────────────────────────────
 try:
-    HF_TOKEN = st.secrets["HF_TOKEN"]
+    ML_KEY = st.secrets["MODELSLAB_KEY"]
 except Exception:
-    HF_TOKEN = None
-    st.error("⚠️ HF_TOKEN tidak ditemukan di secrets. Tambahkan di Streamlit Cloud → Settings → Secrets.")
+    st.error("⚠️ MODELSLAB_KEY tidak ditemukan di secrets.")
     st.stop()
 
+# ── MODEL SEGMENTASI ─────────────────────────────────────────────────────────
 @st.cache_resource
 def load_model():
     if not os.path.exists("best.onnx"):
-        st.error("Model best.onnx tidak ditemukan di repo.")
+        st.error("Model best.onnx tidak ditemukan.")
         st.stop()
     opts = ort.SessionOptions()
     opts.intra_op_num_threads = 1
@@ -49,7 +51,9 @@ def load_model():
 session    = load_model()
 input_name = session.get_inputs()[0].name
 
+# ── HELPERS ──────────────────────────────────────────────────────────────────
 def pil_to_b64(img_pil):
+    """Konversi PIL image ke base64 string."""
     buf = io.BytesIO()
     img_pil.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode()
@@ -85,6 +89,7 @@ def validate_image(f):
     except Exception:
         return None, "File rusak atau bukan gambar valid."
 
+# ── MASK DETECTION ───────────────────────────────────────────────────────────
 def preprocess_image(img_bgr, imgsz=640):
     img = cv2.resize(img_bgr, (imgsz, imgsz))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
@@ -150,6 +155,7 @@ def _remove_noise(mask, min_area=5000):
             out[labels == i] = 1
     return out
 
+# ── TEXTURE → PROMPT ─────────────────────────────────────────────────────────
 def texture_to_prompt(texture_pil):
     arr  = np.array(texture_pil.resize((50, 50)))
     mean = arr.mean(axis=(0, 1))
@@ -172,65 +178,111 @@ def texture_to_prompt(texture_pil):
     elif abs(r - g) < 15 and abs(g - b) < 15:
         hue = "neutral gray"
     elif b > r + 10:
-        hue = "cool gray"
+        hue = "cool gray blue"
     else:
-        hue = "beige warm"
+        hue = "warm beige"
 
     return (
-        f"photorealistic {tone} {hue} wood floor planks, "
-        f"natural wood grain texture, correct perspective and lighting, "
-        f"high quality interior photography, 8k resolution"
+        f"photorealistic {tone} {hue} hardwood floor planks, "
+        f"natural wood grain texture, correct perspective, matching room lighting, "
+        f"interior design photography, 8k, highly detailed"
     )
 
-def call_hf_inpainting(img_pil, mask_pil, prompt, negative_prompt, max_retries=3):
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
-    }
+# ── MODELSLAB INPAINTING (BASE64, TANPA IMGBB) ────────────────────────────────
+def call_modelslab_inpaint(img_pil, mask_pil, prompt, negative_prompt, w, h):
+    """
+    Kirim gambar sebagai base64 langsung ke ModelsLab.
+    Tidak ada upload ke server eksternal — privasi terjaga.
+    """
+    img_b64  = pil_to_b64(img_pil)
+    mask_b64 = pil_to_b64(mask_pil)
+
     payload = {
-        "inputs": prompt,
-        "parameters": {
-            "negative_prompt": negative_prompt,
-            "num_inference_steps": 25,
-            "guidance_scale": 7.5,
-            "strength": 0.95,
-        },
-        "image":      pil_to_b64(img_pil),
-        "mask_image": pil_to_b64(mask_pil),
+        "key":                 ML_KEY,
+        "prompt":              prompt,
+        "negative_prompt":     negative_prompt,
+        "init_image":          f"data:image/png;base64,{img_b64}",
+        "mask_image":          f"data:image/png;base64,{mask_b64}",
+        "width":               str(w),
+        "height":              str(h),
+        "samples":             "1",
+        "num_inference_steps": "30",
+        "safety_checker":      "no",
+        "guidance_scale":      7.5,
+        "strength":            0.9,
+        "base64":              "false",
     }
 
-    for attempt in range(max_retries):
+    try:
+        resp = requests.post(ML_INPAINT_URL, json=payload, timeout=60)
+    except requests.exceptions.Timeout:
+        return None, "Request timeout. Coba lagi."
+
+    if resp.status_code != 200:
+        return None, f"API error {resp.status_code}: {resp.text[:300]}"
+
+    data = resp.json()
+
+    # Langsung sukses — ambil gambar dari URL output
+    if data.get("status") == "success":
+        output_url = data["output"][0]
         try:
-            response = requests.post(HF_API_URL, headers=headers,
-                                     json=payload, timeout=120)
-        except requests.exceptions.Timeout:
-            return None, "Request timeout. Coba lagi."
+            img_resp = requests.get(output_url, timeout=30)
+            return Image.open(io.BytesIO(img_resp.content)).convert("RGB"), None
+        except Exception as e:
+            return None, f"Gagal download hasil: {str(e)}"
 
-        if response.status_code == 200:
-            result = Image.open(io.BytesIO(response.content)).convert("RGB")
-            if result.size != img_pil.size:
-                result = result.resize(img_pil.size, Image.LANCZOS)
-            return result, None
+    # Processing — perlu polling
+    if data.get("status") == "processing":
+        fetch_url  = data.get("fetch_result")
+        eta        = int(data.get("eta", 20))
+        request_id = data.get("id")
 
-        elif response.status_code == 503:
-            wait = 30 * (attempt + 1)
-            st.warning(f"⏳ Model loading... tunggu {wait} detik (attempt {attempt+1}/{max_retries})")
-            time.sleep(wait)
+        if not fetch_url and not request_id:
+            return None, "API tidak memberikan fetch URL."
 
-        elif response.status_code == 422:
-            # Coba resize ke 1024x1024 yang dibutuhkan SDXL
-            img_resized  = img_pil.resize((1024, 1024), Image.LANCZOS)
-            mask_resized = mask_pil.resize((1024, 1024), Image.NEAREST)
-            payload["image"]      = pil_to_b64(img_resized)
-            payload["mask_image"] = pil_to_b64(mask_resized)
-            continue
+        st.info(f"⏳ Diproses server... estimasi {eta} detik")
+        time.sleep(max(eta, 10))
 
-        else:
-            return None, f"API error {response.status_code}: {response.text[:200]}"
+        # Polling maksimal 15x dengan interval 10 detik
+        for attempt in range(15):
+            try:
+                if fetch_url:
+                    poll = requests.post(fetch_url, json={"key": ML_KEY}, timeout=30)
+                else:
+                    poll = requests.post(
+                        f"{ML_FETCH_URL}/{request_id}",
+                        json={"key": ML_KEY}, timeout=30
+                    )
 
-    return None, "Model tidak respond. Coba lagi dalam 1-2 menit."
+                poll_data = poll.json()
 
+                if poll_data.get("status") == "success":
+                    output_url = poll_data["output"][0]
+                    img_resp   = requests.get(output_url, timeout=30)
+                    return Image.open(io.BytesIO(img_resp.content)).convert("RGB"), None
+
+                if poll_data.get("status") == "processing":
+                    st.info(f"⏳ Masih diproses... ({attempt+1}/15)")
+                    time.sleep(10)
+                    continue
+
+                return None, f"Status: {poll_data.get('status')} — {str(poll_data)[:200]}"
+
+            except Exception as e:
+                return None, f"Polling error: {str(e)}"
+
+        return None, "Timeout setelah 15 percobaan. Coba lagi."
+
+    # Error dari API
+    if data.get("status") == "error":
+        return None, f"API error: {data.get('message', str(data))}"
+
+    return None, f"Status tidak dikenal: {str(data)[:200]}"
+
+# ── COMPOSITE ────────────────────────────────────────────────────────────────
 def composite_result(original_pil, result_pil, mask_np, feather=15):
+    """Tempel hasil AI ke foto asli menggunakan mask dengan feathering."""
     orig = np.array(original_pil).astype(np.float32)
     res  = np.array(result_pil.resize(original_pil.size, Image.LANCZOS)).astype(np.float32)
 
@@ -247,6 +299,7 @@ def composite_result(original_pil, result_pil, mask_np, feather=15):
         )
     return Image.fromarray(out.astype(np.uint8))
 
+# ── UI ───────────────────────────────────────────────────────────────────────
 st.title("🏠 Floor Texture Replacer")
 st.write("Upload foto ruangan, pilih tekstur lantai, lalu lihat hasilnya.")
 
@@ -273,20 +326,18 @@ with st.expander("⚙️ Pengaturan lanjutan"):
     conf_threshold = st.slider("Sensitivitas deteksi", 0.10, 0.90, 0.25, 0.05,
         help="Turunkan jika lantai tidak terdeteksi.")
     custom_prompt = st.text_area(
-        "Custom prompt (kosongkan = otomatis dari warna texture)",
-        value=""
+        "Custom prompt (kosongkan = otomatis dari warna texture)", value=""
     )
     negative_prompt = st.text_input(
         "Negative prompt",
-        value="blurry, low quality, distorted, people, furniture, carpet, rug, tiles"
+        value="blurry, low quality, distorted, carpet, rug, tiles, people, furniture"
     )
     feather_radius = st.slider("Kelembutan tepi", 0, 40, 15, 5)
 
 if room_file:
     room_img, err = validate_image(room_file)
     if err:
-        st.error(err)
-        st.stop()
+        st.error(err); st.stop()
 
     st.image(resize_preview(room_img), caption="Foto yang diupload", use_container_width=True)
     room_bgr = cv2.cvtColor(np.array(room_img), cv2.COLOR_RGB2BGR)
@@ -310,7 +361,7 @@ if room_file:
             st.image(resize_preview(Image.fromarray(ov)),
                      caption="Area lantai terdeteksi (hijau)", use_container_width=True)
 
-        # Step 2: Buat prompt dari texture
+        # Step 2: Load texture dan buat prompt
         tex_path = TEXTURES[selected_texture]
         if not os.path.exists(tex_path):
             st.error(f"File texture {selected_texture} tidak ditemukan.")
@@ -321,27 +372,23 @@ if room_file:
         st.write(f"📝 **Prompt:** `{prompt}`")
 
         # Step 3: Siapkan mask PIL
-        mask_resized = cv2.resize(
-            mask, (room_img.size[0], room_img.size[1]),
-            interpolation=cv2.INTER_NEAREST
-        )
-        mask_pil = Image.fromarray((mask_resized * 255).astype(np.uint8)).convert("RGB")
+        w, h         = room_img.size
+        mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        mask_pil     = Image.fromarray((mask_resized * 255).astype(np.uint8)).convert("RGB")
 
-        # Step 4: Panggil HF API
-        with st.spinner("🤖 AI sedang generate lantai... (30-90 detik pertama kali)"):
-            result_pil, err = call_hf_inpainting(
-                room_img, mask_pil, prompt, negative_prompt
+        # Step 4: Panggil ModelsLab
+        with st.spinner("🤖 AI sedang generate lantai... (20-60 detik)"):
+            result_pil, err = call_modelslab_inpaint(
+                room_img, mask_pil, prompt, negative_prompt, w, h
             )
 
         if err:
             st.error(f"❌ {err}")
-            st.info("💡 Jika error 503: model masih loading, tunggu 1 menit lalu coba lagi.")
             st.stop()
 
         # Step 5: Composite ke foto asli
         final_pil = composite_result(room_img, result_pil, mask_resized, feather=feather_radius)
 
-        # Tampilkan
         col1, col2 = st.columns(2)
         with col1:
             st.image(resize_preview(room_img), caption="Original", use_container_width=True)
@@ -349,10 +396,8 @@ if room_file:
             st.image(resize_preview(final_pil),
                      caption=f"Tekstur {selected_texture} (AI)", use_container_width=True)
 
-        with st.expander("🔬 Raw output AI"):
-            st.image(resize_preview(result_pil),
-                     caption="Output langsung dari AI (sebelum composite)",
-                     use_container_width=True)
+        with st.expander("🔬 Raw output AI (sebelum composite)"):
+            st.image(resize_preview(result_pil), use_container_width=True)
 
         buf = io.BytesIO()
         final_pil.save(buf, "JPEG", quality=95)
